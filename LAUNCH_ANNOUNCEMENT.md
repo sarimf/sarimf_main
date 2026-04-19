@@ -1,92 +1,50 @@
-# Launching `file_search` v2 — RAG Library for Our BU
+# `file_search` — minimal RAG Library for Our BU
 
 ## TL;DR
 
-`file_search` is an internal Python library that replicates OpenAI's Assistants file_search tool using our existing GenAI endpoints. v2 adds metadata-based filtering, split retrieval/generation, and query decomposition — bringing it to parity with the patterns used by LlamaIndex, LangChain, and Haystack.
+`file_search` is an internal Python library for grounded retrieval and
+generation over local files. Index files, hybrid-retrieve relevant chunks
+(semantic + BM25, fused via Reciprocal Rank Fusion), and synthesize answers
+with a bound system message. Long queries are decomposed into overlapping
+word-window sub-queries internally and merged with RRF — no extra API calls,
+no new surface area.
 
-Teams can index files, retrieve relevant chunks with strict isolation controls, and build grounded assistants without setting up their own RAG stack. Ships with a reference implementation (AmEx credit card sales cue engine) that other teams can copy as a pattern.
-
----
-
-## What's New in v2
-
-### 1. Arbitrary metadata on chunks
-
-Attach any key-value metadata to files at index time:
-
-```python
-store.add_file("platinum_card.pdf", metadata={
-    "product": "The Platinum Card from American Express",
-    "short_name": "Platinum",
-    "category": "Consumer Charge Card",
-})
-```
-
-Metadata appears in two places:
-
-- **Prefixed into chunk text** — every chunk starts with `[product: Platinum | category: ...]` so the LLM sees which product each fact belongs to
-- **Stored structurally** — code can filter on it without parsing text
-
-The `source` key is added automatically to every chunk for traceability.
-
-### 2. Metadata-based retrieval filtering
-
-Restrict retrieval to matching chunks:
-
-```python
-# Single card
-hits = store.retrieve("annual fee", filters={"short_name": "Platinum"})
-
-# Multiple cards (OR)
-hits = store.retrieve("rewards", filters={"short_name": ["Platinum", "Gold"]})
-
-# Multiple conditions (AND)
-hits = store.retrieve(q, filters={"short_name": "Platinum", "category": "charge"})
-```
-
-This is critical for use cases where cross-contamination is a compliance risk (credit card products, regulated disclosures).
-
-### 3. Split retrieval from generation
-
-Following the standard pattern from LlamaIndex/LangChain/Haystack, retrieval and generation are separate operations:
-
-```python
-# Production pattern: inspect/filter chunks before the LLM call
-hits = store.retrieve(query, filters={...})
-audit_log.record(sources=[h["source"] for h in hits])
-hits = [h for h in hits if h["score"] > 0.3]
-result = engine.synthesize(query, hits)
-
-# Retrieval only — use with any LLM, any prompt
-hits = store.retrieve(query)
-```
-
-### 4. Query decomposition (split-based)
-
-For long or multi-topic input (call transcripts, complex queries), split the input into fixed word-window sub-queries and pass the list to `retrieve()`:
-
-```python
-from file_search import split_query
-
-# Deterministic, no LLM call. Default: 60-word windows, 30-word overlap.
-sub_queries = split_query(long_transcript)
-
-# Per-sub-query hybrid retrieval, merged across sub-queries with RRF.
-hits = store.retrieve(sub_queries, top_k=10, final_k=5)
-```
-
-No LLM is invoked during decomposition or merging, so the path is trivially injection-safe, deterministic, and cheap.
+The library is ~300 lines. Ships with a reference implementation (AmEx credit
+card sales cue engine) other teams can copy.
 
 ---
 
-## Existing Features
+## Public surface
 
-- Parses `.txt`, `.md`, `.pdf`, `.docx`
-- 600-word chunks with 300-word overlap (~800/400 tokens)
-- API embeddings via `text-embedding-3-large` with burst retry (5 rapid tries/burst, exp backoff between bursts, up to 5 bursts) on every LLM and embedding call
-- Hybrid search: semantic (NumPy cosine) + keyword (BM25) via Reciprocal Rank Fusion
-- Optional LLM-based reranking (batched)
-- Save/load via Parquet (inspectable with `pd.read_parquet(...)`)
+```python
+from file_search import VectorStore, QueryEngine
+```
+
+Two classes. That's it.
+
+- `VectorStore` — `add_file`, `save`, `load`, `retrieve`.
+- `QueryEngine` — `__init__(store, system_message=...)`, `synthesize(query, hits)`.
+
+---
+
+## Features
+
+- Parses `.txt`, `.md`, `.pdf`, `.docx`.
+- 600-word chunks with 300-word overlap (~800/400 tokens).
+- API embeddings via `text-embedding-3-large`.
+- Hybrid search: semantic (NumPy cosine) + keyword (BM25) via Reciprocal Rank
+  Fusion.
+- **Automatic query decomposition.** Long queries (more than `CHUNK_SIZE`
+  words) are split internally into overlapping word-window sub-queries;
+  per-sub-query hybrid rankings are RRF-merged. Short queries take the same
+  path with one sub-query (degenerate RRF). No separate API — caller always
+  passes a string.
+- Separate `retrieve()` and `synthesize()` so production code can inspect,
+  audit, or filter hits before generation.
+- Uniform burst retry on every network call: 5 rapid attempts (~0.2 s apart)
+  per burst, exponential backoff between bursts (2 / 4 / 8 / 16 s), up to 5
+  bursts (25 attempts) — retries on any exception.
+- Save/load via Parquet (inspectable with `pd.read_parquet(...)`).
 
 ---
 
@@ -94,23 +52,28 @@ No LLM is invoked during decomposition or merging, so the path is trivially inje
 
 ### Why split retrieval from generation?
 
-Every major RAG framework does this — LangChain has `Retriever` + `Chain`, LlamaIndex has `Retriever` + `ResponseSynthesizer` + `QueryEngine`, Haystack has pipeline nodes, and OpenAI exposes `vector_stores.search` separately from `responses.create`. Production teams need to inspect chunks before generation for audit, debugging, compliance, and to reuse chunks across multiple LLM calls. The class names follow LlamaIndex: `VectorStore` + `QueryEngine`, with `retrieve()` + `synthesize()`.
+Every major RAG framework does this — LangChain has `Retriever` + `Chain`,
+LlamaIndex has `Retriever` + `ResponseSynthesizer` + `QueryEngine`, Haystack
+has pipeline nodes, and OpenAI exposes `vector_stores.search` separately from
+`responses.create`. Production teams need to inspect chunks before generation
+for audit, debugging, and compliance, and to reuse chunks across multiple LLM
+calls. The class names follow LlamaIndex: `VectorStore` + `QueryEngine`, with
+`retrieve()` + `synthesize()`.
 
-### Why metadata in the chunk text AND in structured storage?
+### Why deterministic query splitting?
 
-Both are needed. Structured storage enables code-level filtering before retrieval. Text prefix enables the LLM to attribute facts correctly at generation time. Either alone is insufficient for strict isolation — LLMs can still leak cross-product information even when retrieval is filtered, and filtering alone doesn't help the LLM organize the chunks it receives.
+No LLM call means deterministic behavior, no latency, no cost, and no prompt
+injection surface — raw customer input is never passed back to an LLM as
+instructions. Reusing the same `CHUNK_SIZE`/`CHUNK_OVERLAP` as document
+indexing keeps query and document granularity aligned, which is what hybrid
+search expects.
 
-### Why auto-attach `source` to metadata?
+### Why `final_k` can exceed `top_k`
 
-Teams forget to add it, and then debugging "which file did this chunk come from?" becomes annoying. Having it always present makes `filters={"source": "..."}` work universally.
-
-### Why split-based decomposition?
-
-No LLM call means the decomposition step is deterministic, cheap, and trivially injection-safe — adversarial content in the input can't influence a model that never sees the input. Hybrid search tolerates verbose sub-queries well: BM25 is bag-of-words, and embeddings compress the signal naturally.
-
-### Why all this if OpenAI's file_search just works?
-
-OpenAI's file_search requires the `/files` upload endpoint, which our current proxy doesn't reliably support. Rather than block on proxy fixes, we built a local replica using the endpoints we know work (chat completions + embeddings).
+With N sub-queries, the merged RRF pool can hold up to N × `top_k` unique
+chunks. `final_k` is an upper bound on the returned list — when sub-queries
+overlap heavily, the unique pool may be smaller than `final_k`, so fewer
+hits are returned.
 
 ---
 
@@ -122,35 +85,31 @@ OpenAI's file_search requires the `/files` upload endpoint, which our current pr
 |---|---|---|
 | `system_message` | Grounded-RAG default | Your team's prompt (override) |
 
-### Per-call retrieval config
+### `VectorStore.retrieve` — per-call retrieval config
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `query` | — | A single string, or a list of queries (list ⇒ per-query hybrid retrieval merged by RRF) |
-| `top_k` | `10` | Candidates pulled from hybrid search (per query when list) |
-| `final_k` | `5` | Returned after optional rerank / RRF merge |
-| `rerank` | `False` | Enable LLM reranking (+1 call, better quality; single-query only) |
-| `filters` | `None` | Restrict to chunks whose metadata matches |
+| `query` | — | A search string (long queries are split internally) |
+| `top_k` | `10` | Candidates pulled from hybrid search per sub-query |
+| `final_k` | `5` | Upper bound on the returned list (after RRF merge) |
 
-Internal tuning knobs (LLM model name, chunk size/overlap, embedding dims, batch size, generation temperature and max tokens) are module-level constants in `file_search.py`. Edit them there if needed — no real caller has wanted to change them per-instance.
+Internal tuning knobs — `LLM_MODEL`, `CHUNK_SIZE`, `CHUNK_OVERLAP`,
+`EMBED_DIMS`, `EMBED_BATCH_SIZE` — are module-level constants in
+`file_search.py`. Edit them there if needed.
 
 ---
 
 ## Dummy Usage Example
 
-Q&A bot over internal policy documents with metadata filtering:
+Q&A bot over internal policy documents:
 
 ```python
 from file_search import VectorStore, QueryEngine
 
-# 1. Index your files with metadata
+# 1. Index your files
 store = VectorStore()
-store.add_file("policies/remote_work.pdf",
-               metadata={"policy_type": "HR", "region": "US", "effective_year": "2024"})
-store.add_file("policies/remote_work_india.pdf",
-               metadata={"policy_type": "HR", "region": "India", "effective_year": "2024"})
-store.add_file("policies/expense_policy.docx",
-               metadata={"policy_type": "Finance", "region": "Global"})
+store.add_file("policies/remote_work.pdf")
+store.add_file("policies/expense_policy.docx")
 store.save("policy_index.parquet")
 
 # 2. In your service — load once, reuse across queries
@@ -164,24 +123,11 @@ engine = QueryEngine(
 )
 
 # 3. Per-query: split retrieval from generation for audit/inspection
-def answer_question(question: str, user_region: str):
-    # Restrict retrieval to policies relevant to the user's region
-    hits = store.retrieve(
-        question,
-        filters={"region": [user_region, "Global"]},
-    )
-
-    # Log for audit (compliance trails, debugging)
-    audit_log.record(
-        question=question,
-        region=user_region,
-        sources=[h["source"] for h in hits],
-    )
-
-    # Generate the answer
+def answer_question(question: str):
+    hits = store.retrieve(question)
     return engine.synthesize(question, hits)
 
-result = answer_question("Can I expense a taxi to a client dinner?", user_region="US")
+result = answer_question("Can I expense a taxi to a client dinner?")
 print(result["answer"])
 ```
 
@@ -189,16 +135,17 @@ print(result["answer"])
 
 ## Comparison with OpenAI's file_search
 
-| Feature | OpenAI file_search | Our `file_search` v2 |
+| Feature | OpenAI file_search | Our `file_search` |
 |---|---|---|
 | File upload & indexing | ✅ | ✅ |
 | Chunking (800/400 tokens equiv) | ✅ | ✅ |
 | Hybrid search (semantic + BM25) | ✅ | ✅ |
 | Rank fusion (RRF) | ✅ | ✅ |
-| Reranking | ✅ (built-in) | ✅ (LLM-based, batched, optional) |
-| **Query decomposition** | ✅ (LLM-based) | ✅ **(split-based, deterministic)** |
-| **Metadata filtering** | ✅ (attribute filters) | ✅ **(new in v2)** |
-| **Retrieval/generation split** | ✅ (`vector_stores.search`) | ✅ **(new in v2)** |
+| Reranking | ✅ (built-in) | ❌ (removed) |
+| Query rewriting | ✅ | ❌ (removed) |
+| Query decomposition | ✅ (built-in) | ✅ (automatic, deterministic) |
+| Metadata filtering | ✅ (attribute filters) | ❌ (removed) |
+| Retrieval/generation split | ✅ | ✅ |
 | Persistence | ✅ (cloud) | ✅ (local parquet) |
 | Source citations | ✅ | ✅ |
 | Customizable system prompt | ❌ (limited) | ✅ |
@@ -207,23 +154,28 @@ print(result["answer"])
 
 ### What's Still Missing vs. OpenAI
 
-Being honest about remaining gaps:
-
-1. **OCR on scanned PDFs.** OpenAI handles scanned documents via OCR; we only extract embedded text. Workaround: run Tesseract upstream.
-2. **Image parsing inside documents.** OpenAI parses charts and table images; we only extract text.
-3. **Document-aware chunking.** OpenAI respects section boundaries; we chunk by word count.
-4. **Operator-based metadata filters.** OpenAI supports `gt`, `lt`, `in`, `ne`; we support equality and membership only. For date ranges, post-filter in your code.
-5. **Parallel file ingestion.** OpenAI indexes in parallel server-side; ours is sequential.
-6. **Structured file support (CSV, JSONL).** OpenAI parses with row awareness; we treat them as raw text.
-7. **Cloud-managed vector store.** OpenAI is distributed; ours is a local parquet file. Fine for corpus sizes up to ~100K chunks.
+1. **OCR on scanned PDFs.** OpenAI handles scanned documents via OCR; we only
+   extract embedded text. Workaround: run Tesseract upstream.
+2. **Image parsing inside documents.** OpenAI parses charts and table images;
+   we only extract text.
+3. **Document-aware chunking.** OpenAI respects section boundaries; we chunk
+   by word count.
+4. **Parallel file ingestion.** OpenAI indexes in parallel server-side; ours
+   is sequential.
+5. **Structured file support (CSV, JSONL).** OpenAI parses with row awareness;
+   we treat them as raw text.
+6. **Cloud-managed vector store.** OpenAI is distributed; ours is a local
+   parquet file. Fine for corpus sizes up to ~100K chunks.
 
 ---
 
 ## Getting Started
 
-1. **Read the notebook** (`example_amex_card_assistant.ipynb`) — real use case end-to-end showing metadata, filtering, split retrieval/generation, and decomposition
-2. **Copy the pattern** for your own use case — mostly this means writing a good `system_message` and defining your metadata schema
-3. **Ping us** with questions, bug reports, or feature requests
+1. **Read the notebook** (`example_amex_card_assistant.ipynb`) — a real
+   use-case end-to-end.
+2. **Copy the pattern** for your own use case — mostly this means writing a
+   good `system_message`.
+3. **Ping us** with questions, bug reports, or feature requests.
 
 Dependencies (most already available in our internal Python env):
 
@@ -235,9 +187,6 @@ pip install numpy pandas pyarrow rank-bm25 tenacity openai pypdf python-docx
 
 ## Roadmap
 
-Based on early team conversations, these are candidates for future releases:
-
-- Operator-based metadata filters (`gt`, `lt`, `in`, `ne`)
 - OCR integration for scanned documents
 - Async retrieval for higher-throughput services
 - Swappable vector backend (FAISS) for larger corpora
@@ -248,4 +197,5 @@ If one of these is blocking your use case, let us know.
 
 ## Feedback
 
-This is v2. The library has been shaped heavily by team questions and real-world integration requests — keep them coming. The library is small (~500 lines) and easy to modify.
+The library is small (~300 lines) and easy to modify. Keep the questions and
+real-world integration requests coming.
