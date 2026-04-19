@@ -48,21 +48,17 @@ This is critical for use cases where cross-contamination is a compliance risk (c
 
 ### 3. Split retrieval from generation
 
-Following the standard pattern from LlamaIndex/LangChain/Haystack, retrieval and generation are now separate operations:
+Following the standard pattern from LlamaIndex/LangChain/Haystack, retrieval and generation are separate operations:
 
 ```python
-# Pattern 1: Combined (simple Q&A)
-result = assistant.ask(query)
-
-# Pattern 2: Split (production — inspect/filter chunks before LLM)
+# Production pattern: inspect/filter chunks before the LLM call
 hits = store.retrieve(query, metadata_filter={...})
 audit_log.record(sources=[h["source"] for h in hits])
 hits = [h for h in hits if h["score"] > 0.3]
 result = assistant.synthesize(query, hits)
 
-# Pattern 3: Retrieval only (custom generation)
+# Retrieval only — use with any LLM, any prompt
 hits = store.retrieve(query)
-# use with any LLM, any prompt
 ```
 
 ### 4. Query decomposition (injection-safe)
@@ -83,21 +79,17 @@ hits = store.retrieve_multi(queries=sub_queries, per_query_k=3, final_k=10)
 
 The decomposer wraps input in `<DATA>` tags and explicitly instructs the LLM to treat content as inert — safe against prompt injection from user-generated content.
 
-### 5. Backward compatibility
-
-v1 indexes (saved before v2) load seamlessly — the library fills in empty metadata dicts as a fallback. No migration required.
-
 ---
 
-## Existing Features (unchanged from v1)
+## Existing Features
 
 - Parses `.txt`, `.md`, `.pdf`, `.docx`
 - 600-word chunks with 300-word overlap (~800/400 tokens)
 - API embeddings via `text-embedding-3-large` with retry/backoff
 - Hybrid search: semantic (NumPy cosine) + keyword (BM25) via Reciprocal Rank Fusion
-- Optional query rewriting for long/messy user input
+- Optional query rewriting (enabled by passing `extraction_instructions`)
 - Optional LLM-based reranking (batched)
-- Save/load via pickle for index reuse
+- Save/load via Parquet (inspectable with `pd.read_parquet(...)`)
 
 ---
 
@@ -105,7 +97,7 @@ v1 indexes (saved before v2) load seamlessly — the library fills in empty meta
 
 ### Why split retrieval from generation?
 
-Every major RAG framework does this — LangChain has `Retriever` + `Chain`, LlamaIndex has `Retriever` + `ResponseSynthesizer` + `QueryEngine`, Haystack has pipeline nodes, and OpenAI exposes `vector_stores.search` separately from `responses.create`. Production teams need to inspect chunks before generation for audit, debugging, compliance, and to reuse chunks across multiple LLM calls. v2 follows the LlamaIndex naming: `retrieve()` + `synthesize()` + `ask()` (convenience wrapper).
+Every major RAG framework does this — LangChain has `Retriever` + `Chain`, LlamaIndex has `Retriever` + `ResponseSynthesizer` + `QueryEngine`, Haystack has pipeline nodes, and OpenAI exposes `vector_stores.search` separately from `responses.create`. Production teams need to inspect chunks before generation for audit, debugging, compliance, and to reuse chunks across multiple LLM calls. v2 follows the LlamaIndex naming: `retrieve()` + `synthesize()`.
 
 ### Why metadata in the chunk text AND in structured storage?
 
@@ -132,20 +124,12 @@ OpenAI's file_search requires the `/files` upload endpoint, which our current pr
 | Parameter | Default | Purpose |
 |---|---|---|
 | `llm_model` | `"gpt-41"` | Model for rewrite/decompose/rerank calls |
-| `embed_dims` | `256` | Embedding dimensions (256/1024/3072) |
-| `chunk_size` | `600` words | Larger = more context per chunk |
-| `chunk_overlap` | `300` words | Higher = better cross-boundary matches |
-| `max_query_chars` | `30000` | Truncation guard against embedding API limits |
-| `embed_batch_size` | `64` | Texts per embedding API call |
 
 ### `Assistant` — answer-generation config
 
 | Parameter | Default | Purpose |
 |---|---|---|
 | `system_message` | Grounded-RAG default | Your team's prompt (override) |
-| `context_template` | `"\n\nCONTEXT:\n{context}"` | How chunks are labeled in prompt |
-| `temperature` | `0.2` | Lower for factual, higher for creative |
-| `max_tokens` | `500` | Response length cap |
 | `model` | `"gpt-41"` | Generation model |
 
 ### Per-call retrieval config
@@ -155,10 +139,11 @@ OpenAI's file_search requires the `/files` upload endpoint, which our current pr
 | `top_k` | `10` | Candidates pulled from hybrid search |
 | `final_k` | `5` | Returned after optional rerank |
 | `rerank` | `False` | Enable LLM reranking (+1 call, better quality) |
-| `rewrite` | `False` | Enable LLM query rewriting |
-| `extraction_instructions` | `None` | Required if `rewrite=True` |
+| `extraction_instructions` | `None` | If truthy, rewrite the query via LLM before searching |
 | `metadata_filter` | `None` | Restrict to chunks whose metadata matches |
-| `extra_user_context` | `None` | (ask/synthesize only) Extra user message content |
+| `extra_user_context` | `None` | (synthesize only) Extra user message content |
+
+Internal tuning knobs (chunk size/overlap, embedding dims, batch size, generation temperature and max tokens, context template) are module-level constants in `file_search.py`. Edit them there if needed — no real caller has wanted to change them per-instance.
 
 ---
 
@@ -167,53 +152,43 @@ OpenAI's file_search requires the `/files` upload endpoint, which our current pr
 Q&A bot over internal policy documents with metadata filtering:
 
 ```python
-from openai import AzureOpenAI
 from file_search import FileSearch, Assistant
 
-# 1. Build the LLM client
-client = AzureOpenAI(
-    azure_endpoint="https://eag-qa.aexp.com/genai/microsoft/v1/models/gpt-41/",
-    api_key=get_token_from_env('gpt41'),
-    api_version="2024-10-21",
-)
-
-# 2. Index your files with metadata
-store = FileSearch(llm_client=client)
+# 1. Index your files with metadata
+store = FileSearch()
 store.add_file("policies/remote_work.pdf",
                metadata={"policy_type": "HR", "region": "US", "effective_year": "2024"})
 store.add_file("policies/remote_work_india.pdf",
                metadata={"policy_type": "HR", "region": "India", "effective_year": "2024"})
 store.add_file("policies/expense_policy.docx",
                metadata={"policy_type": "Finance", "region": "Global"})
-store.save("policy_index.pkl")
+store.save("policy_index.parquet")
 
-# 3. In your service — load once, reuse across queries
-store = FileSearch.load("policy_index.pkl", llm_client=client)
+# 2. In your service — load once, reuse across queries
+store = FileSearch.load("policy_index.parquet")
 assistant = Assistant(
-    store=store,
-    client=client,
+    store,
     system_message=(
         "You are an HR policy assistant. Answer employee questions using ONLY "
         "the policy context below. Cite sources inline."
     ),
-    temperature=0.1,
 )
 
-# 4. Per-query: split retrieval from generation for audit/inspection
+# 3. Per-query: split retrieval from generation for audit/inspection
 def answer_question(question: str, user_region: str):
     # Restrict retrieval to policies relevant to the user's region
     hits = store.retrieve(
         question,
         metadata_filter={"region": [user_region, "Global"]},
     )
-    
+
     # Log for audit (compliance trails, debugging)
     audit_log.record(
         question=question,
         region=user_region,
         sources=[h["source"] for h in hits],
     )
-    
+
     # Generate the answer
     return assistant.synthesize(question, hits)
 
@@ -236,7 +211,7 @@ print(result["answer"])
 | **Query decomposition** | ✅ (built-in) | ✅ **(new in v2)** |
 | **Metadata filtering** | ✅ (attribute filters) | ✅ **(new in v2)** |
 | **Retrieval/generation split** | ✅ (`vector_stores.search`) | ✅ **(new in v2)** |
-| Persistence | ✅ (cloud) | ✅ (local pickle) |
+| Persistence | ✅ (cloud) | ✅ (local parquet) |
 | Source citations | ✅ | ✅ |
 | Customizable system prompt | ❌ (limited) | ✅ |
 | Works behind our proxy | ❌ | ✅ |
@@ -252,7 +227,7 @@ Being honest about remaining gaps:
 4. **Operator-based metadata filters.** OpenAI supports `gt`, `lt`, `in`, `ne`; we support equality and membership only. For date ranges, post-filter in your code.
 5. **Parallel file ingestion.** OpenAI indexes in parallel server-side; ours is sequential.
 6. **Structured file support (CSV, JSONL).** OpenAI parses with row awareness; we treat them as raw text.
-7. **Cloud-managed vector store.** OpenAI is distributed; ours is a local pickle file. Fine for corpus sizes up to ~100K chunks.
+7. **Cloud-managed vector store.** OpenAI is distributed; ours is a local parquet file. Fine for corpus sizes up to ~100K chunks.
 
 ---
 
@@ -265,19 +240,8 @@ Being honest about remaining gaps:
 Dependencies (most already available in our internal Python env):
 
 ```
-pip install numpy rank-bm25 tenacity openai pypdf python-docx
+pip install numpy pandas pyarrow rank-bm25 tenacity openai pypdf python-docx
 ```
-
----
-
-## Migrating from v1
-
-Most v1 code works unchanged. The breaking considerations:
-
-- **`add_file(path)` still works** — metadata is optional; auto-attaches `source`
-- **`add_file(path, metadata={...})`** — new optional parameter
-- **Chunks now have a metadata prefix in their text** — this affects embeddings (usually positively) and anywhere you inspect chunk text directly
-- **v1 pickle indexes load in v2** — empty metadata dicts filled in automatically. No migration needed, but re-indexing gives you the benefits of the prefix.
 
 ---
 
@@ -296,4 +260,4 @@ If one of these is blocking your use case, let us know.
 
 ## Feedback
 
-This is v2. The library has been shaped heavily by team questions and real-world integration requests — keep them coming. The library is small (~700 lines) and easy to modify.
+This is v2. The library has been shaped heavily by team questions and real-world integration requests — keep them coming. The library is small (~500 lines) and easy to modify.
