@@ -44,6 +44,9 @@ EMBED_DIMS = 256
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 300
 EMBED_BATCH_SIZE = 64
+MAX_SUB_QUERIES = 16
+SUB_QUERY_CHUNK_SIZE = CHUNK_SIZE
+SUB_QUERY_OVERLAP = CHUNK_OVERLAP
 DEFAULT_SYSTEM = (
     "Answer using ONLY the context below. If the answer isn't in the context, "
     "say you don't know. Cite sources inline as [Source: <filename>]."
@@ -89,17 +92,21 @@ def _parse_file(path: str) -> str:
     raise ValueError(f"Unsupported file type: {ext}. Supported: .txt, .md, .pdf, .docx")
 
 
-def _split_text(text: str) -> list[str]:
+def _split_text(
+    text: str,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+) -> list[str]:
     words = text.split()
     if not words:
         return []
-    step = CHUNK_SIZE - CHUNK_OVERLAP
+    step = chunk_size - overlap
     chunks = []
     for i in range(0, len(words), step):
-        chunk = " ".join(words[i:i + CHUNK_SIZE])
+        chunk = " ".join(words[i:i + chunk_size])
         if chunk:
             chunks.append(chunk)
-        if i + CHUNK_SIZE >= len(words):
+        if i + chunk_size >= len(words):
             break
     return chunks
 
@@ -269,11 +276,19 @@ class VectorStore:
         return store
 
     # -------------------- Retrieval primitives --------------------
-    def _dense_retrieve(self, q_vec: np.ndarray, k: int) -> list[int]:
-        sims = self.embeddings @ q_vec
-        k = min(k, len(sims))
-        top = np.argpartition(-sims, k - 1)[:k]
-        return top[np.argsort(-sims[top])].tolist()
+    def _dense_retrieve_batch(self, q_vecs: np.ndarray, k: int) -> list[list[int]]:
+        """Top-k dense indices per sub-query, via one batched matmul.
+
+        `q_vecs` is (N_sub, dim). Returns a list of N_sub top-k index lists.
+        """
+        sims_all = self.embeddings @ q_vecs.T
+        k = min(k, sims_all.shape[0])
+        out = []
+        for j in range(sims_all.shape[1]):
+            sims = sims_all[:, j]
+            top = np.argpartition(-sims, k - 1)[:k]
+            out.append(top[np.argsort(-sims[top])].tolist())
+        return out
 
     def _sparse_retrieve(self, query: str, k: int) -> list[int]:
         scores = self.bm25.get_scores(query.lower().split())
@@ -287,44 +302,55 @@ class VectorStore:
                 scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
         return sorted(scores.items(), key=lambda x: -x[1])
 
-    def _hybrid_search(self, query: str, q_vec: np.ndarray, k: int) -> list[tuple[int, float]]:
-        dense = self._dense_retrieve(q_vec, k)
-        sparse = self._sparse_retrieve(query, k)
-        return self._rrf([dense, sparse])[:k]
-
     # -------------------- Retrieval --------------------
     def retrieve(
         self,
         query: str,
         top_k: int = 10,
         top_n: int = 5,
+        sub_chunk_size: Optional[int] = None,
+        sub_overlap: Optional[int] = None,
     ) -> list[dict]:
         """Retrieve relevant chunks for a query.
 
-        Long queries (more than CHUNK_SIZE words) are split internally into
-        overlapping word-window sub-queries. Hybrid search runs per sub-query
-        pulling top_k each; rankings are merged with Reciprocal Rank Fusion and
-        the top top_n are returned. Short queries take the same path with one
-        sub-query (degenerate RRF).
+        Long queries are split internally into overlapping word-window
+        sub-queries via `_split_text`. Window size and overlap default to
+        SUB_QUERY_CHUNK_SIZE / SUB_QUERY_OVERLAP; override per call via
+        `sub_chunk_size` / `sub_overlap` — larger windows yield coarser
+        probes and lower cost.
 
-        All sub-query embeddings are computed in a single batched API call —
-        one network round-trip regardless of N.
+        The sub-query list is capped at MAX_SUB_QUERIES via evenly-spaced
+        indices (preserving coverage across the prompt), so cost stays
+        bounded regardless of query length. Hybrid search runs per sub-query
+        pulling top_k each; rankings are merged with Reciprocal Rank Fusion
+        and the top top_n are returned.
+
+        All sub-query embeddings are computed in a single batched API call,
+        and dense similarities are computed in a single matmul.
 
         top_n MAY exceed top_k: with N sub-queries, the RRF pool can hold up
-        to N*top_k unique chunks. top_n is an upper bound on the returned
-        list — when sub-queries overlap heavily, the unique pool may be smaller
-        than top_n, in which case fewer hits are returned.
+        to N*top_k unique chunks. top_n is an upper bound — heavy sub-query
+        overlap may shrink the unique pool below top_n.
         """
         if not self.chunks:
             return []
 
-        sub_queries = _split_text(query) or [query]
-        q_vecs = _embed_texts(sub_queries)
+        chunk_size = SUB_QUERY_CHUNK_SIZE if sub_chunk_size is None else sub_chunk_size
+        overlap = SUB_QUERY_OVERLAP if sub_overlap is None else sub_overlap
 
-        rankings = [
-            [i for i, _ in self._hybrid_search(sub_q, q_vecs[i], top_k)]
-            for i, sub_q in enumerate(sub_queries)
-        ]
+        sub_queries = _split_text(query, chunk_size, overlap) or [query]
+        if len(sub_queries) > MAX_SUB_QUERIES:
+            idxs = np.linspace(0, len(sub_queries) - 1, MAX_SUB_QUERIES, dtype=int)
+            sub_queries = [sub_queries[i] for i in idxs]
+
+        q_vecs = _embed_texts(sub_queries)
+        dense_rankings = self._dense_retrieve_batch(q_vecs, top_k)
+
+        rankings = []
+        for j, sub_q in enumerate(sub_queries):
+            sparse = self._sparse_retrieve(sub_q, top_k)
+            merged = self._rrf([dense_rankings[j], sparse])[:top_k]
+            rankings.append([i for i, _ in merged])
         fused = self._rrf(rankings)[:top_n]
 
         return [

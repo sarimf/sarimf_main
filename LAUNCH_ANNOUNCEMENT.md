@@ -43,11 +43,14 @@ Two classes. That's it.
 - API embeddings via `text-embedding-3-large`.
 - Hybrid search: semantic (NumPy cosine) + keyword (BM25) via Reciprocal Rank
   Fusion.
-- **Automatic query decomposition.** Long queries (more than `CHUNK_SIZE`
-  words) are split internally into overlapping word-window sub-queries;
-  per-sub-query hybrid rankings are RRF-merged. Short queries take the same
-  path with one sub-query (degenerate RRF). No separate API — caller always
-  passes a string.
+- **Automatic query decomposition, cost-bounded.** Long queries are split
+  internally into overlapping word-window sub-queries; per-sub-query hybrid
+  rankings are RRF-merged. The sub-query count is capped at
+  `MAX_SUB_QUERIES` (evenly-spaced), so embedding / BM25 / matmul cost stays
+  bounded regardless of query length. Sub-query window size and overlap
+  (`SUB_QUERY_CHUNK_SIZE` / `SUB_QUERY_OVERLAP`) are tunable independently
+  of the indexing window, with per-call overrides on `retrieve()`. Short
+  queries take the same path with one sub-query (degenerate RRF).
 - Separate `retrieve()` and `synthesize()` so production code can inspect,
   audit, or filter hits before generation.
 - Uniform burst retry on every network call: 5 rapid attempts (~0.2 s apart)
@@ -109,10 +112,18 @@ hits are returned.
 | `query` | — | A search string (long queries are split internally) |
 | `top_k` | `10` | Candidates pulled from hybrid search per sub-query |
 | `top_n` | `5` | Upper bound on the returned list (after RRF merge) |
+| `sub_chunk_size` | `None` → `SUB_QUERY_CHUNK_SIZE` | Per-call override for sub-query window size (words) |
+| `sub_overlap` | `None` → `SUB_QUERY_OVERLAP` | Per-call override for sub-query window overlap (words) |
 
 Internal tuning knobs — `LLM_MODEL`, `LLM_ENDPOINT_NAME`, `LLM_TOKEN_KEY`,
-`CHUNK_SIZE`, `CHUNK_OVERLAP`, `EMBED_DIMS`, `EMBED_BATCH_SIZE` — are
+`CHUNK_SIZE`, `CHUNK_OVERLAP`, `EMBED_DIMS`, `EMBED_BATCH_SIZE`,
+`MAX_SUB_QUERIES`, `SUB_QUERY_CHUNK_SIZE`, `SUB_QUERY_OVERLAP` — are
 module-level constants in `file_search.py`. Edit them there if needed.
+`MAX_SUB_QUERIES` (`16`) caps retrieval-side sub-query decomposition to
+keep embedding / BM25 / matmul cost bounded for long prompts.
+`SUB_QUERY_CHUNK_SIZE` / `SUB_QUERY_OVERLAP` (default to `CHUNK_SIZE` /
+`CHUNK_OVERLAP`) let you use coarser windows at retrieval time than at
+indexing time — larger windows = fewer, coarser probes, lower cost.
 
 ---
 
