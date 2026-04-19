@@ -61,24 +61,21 @@ result = engine.synthesize(query, hits)
 hits = store.retrieve(query)
 ```
 
-### 4. Query decomposition (injection-safe)
+### 4. Query decomposition (split-based)
 
-For long or multi-topic input (call transcripts, complex queries), break input into focused sub-queries:
+For long or multi-topic input (call transcripts, complex queries), split the input into fixed word-window sub-queries and pass the list to `retrieve()`:
 
 ```python
-# Safe even when input contains adversarial content
-sub_queries = rewrite_queries(
-    data=long_transcript,
-    rewrite_instructions="Extract customer concerns about AmEx products",
-    max_queries=20,
-)
-# Returns: ["Platinum annual fee", "Gold groceries rewards", ...]
+from file_search import split_query
 
-# Pass a list to retrieve() — results are ranked by vote count across queries
-hits = store.retrieve(sub_queries, top_k=3, final_k=10)
+# Deterministic, no LLM call. Default: 60-word windows, 30-word overlap.
+sub_queries = split_query(long_transcript)
+
+# Per-sub-query hybrid retrieval, merged across sub-queries with RRF.
+hits = store.retrieve(sub_queries, top_k=10, final_k=5)
 ```
 
-The decomposer wraps input in `<DATA>` tags and explicitly instructs the LLM to treat content as inert — safe against prompt injection from user-generated content.
+No LLM is invoked during decomposition or merging, so the path is trivially injection-safe, deterministic, and cheap.
 
 ---
 
@@ -86,9 +83,8 @@ The decomposer wraps input in `<DATA>` tags and explicitly instructs the LLM to 
 
 - Parses `.txt`, `.md`, `.pdf`, `.docx`
 - 600-word chunks with 300-word overlap (~800/400 tokens)
-- API embeddings via `text-embedding-3-large` with retry/backoff
+- API embeddings via `text-embedding-3-large` with burst retry (5 rapid tries/burst, exp backoff between bursts, up to 5 bursts) on every LLM and embedding call
 - Hybrid search: semantic (NumPy cosine) + keyword (BM25) via Reciprocal Rank Fusion
-- Optional query rewriting (enabled by passing `rewrite_instructions`)
 - Optional LLM-based reranking (batched)
 - Save/load via Parquet (inspectable with `pd.read_parquet(...)`)
 
@@ -108,9 +104,9 @@ Both are needed. Structured storage enables code-level filtering before retrieva
 
 Teams forget to add it, and then debugging "which file did this chunk come from?" becomes annoying. Having it always present makes `filters={"source": "..."}` work universally.
 
-### Why injection-safe decomposition?
+### Why split-based decomposition?
 
-Raw user input (call transcripts, customer emails) can contain imperative language that an LLM interprets as instructions ("ignore previous instructions," "output X"). When we pass this to the decomposer, we need strong separation. Wrapping in `<DATA>` tags, explicit role declaration, and explicit immunity clauses cut this risk dramatically.
+No LLM call means the decomposition step is deterministic, cheap, and trivially injection-safe — adversarial content in the input can't influence a model that never sees the input. Hybrid search tolerates verbose sub-queries well: BM25 is bag-of-words, and embeddings compress the signal naturally.
 
 ### Why all this if OpenAI's file_search just works?
 
@@ -130,11 +126,10 @@ OpenAI's file_search requires the `/files` upload endpoint, which our current pr
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `query` | — | A single string, or a list of queries (list ⇒ vote-count ranking) |
+| `query` | — | A single string, or a list of queries (list ⇒ per-query hybrid retrieval merged by RRF) |
 | `top_k` | `10` | Candidates pulled from hybrid search (per query when list) |
-| `final_k` | `5` | Returned after optional rerank / vote merge |
+| `final_k` | `5` | Returned after optional rerank / RRF merge |
 | `rerank` | `False` | Enable LLM reranking (+1 call, better quality; single-query only) |
-| `rewrite_instructions` | `None` | If truthy, rewrite the query via LLM before searching (single-query only) |
 | `filters` | `None` | Restrict to chunks whose metadata matches |
 
 Internal tuning knobs (LLM model name, chunk size/overlap, embedding dims, batch size, generation temperature and max tokens) are module-level constants in `file_search.py`. Edit them there if needed — no real caller has wanted to change them per-instance.
@@ -201,8 +196,7 @@ print(result["answer"])
 | Hybrid search (semantic + BM25) | ✅ | ✅ |
 | Rank fusion (RRF) | ✅ | ✅ |
 | Reranking | ✅ (built-in) | ✅ (LLM-based, batched, optional) |
-| Query rewriting | ✅ | ✅ (opt-in, with custom extraction) |
-| **Query decomposition** | ✅ (built-in) | ✅ **(new in v2)** |
+| **Query decomposition** | ✅ (LLM-based) | ✅ **(split-based, deterministic)** |
 | **Metadata filtering** | ✅ (attribute filters) | ✅ **(new in v2)** |
 | **Retrieval/generation split** | ✅ (`vector_stores.search`) | ✅ **(new in v2)** |
 | Persistence | ✅ (cloud) | ✅ (local parquet) |
