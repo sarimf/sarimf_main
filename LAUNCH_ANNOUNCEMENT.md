@@ -31,6 +31,10 @@ Two classes. That's it.
 
 - Parses `.txt`, `.md`, `.pdf`, `.docx`.
 - 600-word chunks with 300-word overlap (~800/400 tokens).
+- **Metadata prefix at indexing time** — pass `metadata={...}` to `add_file`;
+  the keys are rendered as `[k: v | ... | source: <stem>]` at the top of every
+  chunk, so the LLM sees attribution inline in CONTEXT. No structural storage,
+  no retrieval-time filtering.
 - API embeddings via `text-embedding-3-large`.
 - Hybrid search: semantic (NumPy cosine) + keyword (BM25) via Reciprocal Rank
   Fusion.
@@ -67,6 +71,13 @@ injection surface — raw customer input is never passed back to an LLM as
 instructions. Reusing the same `CHUNK_SIZE`/`CHUNK_OVERLAP` as document
 indexing keeps query and document granularity aligned, which is what hybrid
 search expects.
+
+### Why metadata as text prefix only?
+
+Callers that want product attribution at generation time get it for free via
+the prefix — every chunk carries its own `[product: ... | source: ...]` tag
+that flows unchanged into CONTEXT. We don't pay the complexity cost of a
+filtering code path when retrieval-time filtering isn't a BU requirement.
 
 ### Why `final_k` can exceed `top_k`
 
@@ -106,9 +117,12 @@ Q&A bot over internal policy documents:
 ```python
 from file_search import VectorStore, QueryEngine
 
-# 1. Index your files
+# 1. Index your files (metadata is prefixed into every chunk's text)
 store = VectorStore()
-store.add_file("policies/remote_work.pdf")
+store.add_file(
+    "policies/remote_work.pdf",
+    metadata={"policy_type": "HR", "region": "US"},
+)
 store.add_file("policies/expense_policy.docx")
 store.save("policy_index.parquet")
 
@@ -145,6 +159,7 @@ print(result["answer"])
 | Query rewriting | ✅ | ❌ (removed) |
 | Query decomposition | ✅ (built-in) | ✅ (automatic, deterministic) |
 | Metadata filtering | ✅ (attribute filters) | ❌ (removed) |
+| Metadata prefix (indexing-time) | ❌ | ✅ (text-only, no filtering) |
 | Retrieval/generation split | ✅ | ✅ |
 | Persistence | ✅ (cloud) | ✅ (local parquet) |
 | Source citations | ✅ | ✅ |
