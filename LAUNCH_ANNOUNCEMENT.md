@@ -55,11 +55,7 @@ Following the standard pattern from LlamaIndex/LangChain/Haystack, retrieval and
 hits = store.retrieve(query, filters={...})
 audit_log.record(sources=[h["source"] for h in hits])
 hits = [h for h in hits if h["score"] > 0.3]
-result = synthesize(query, hits)
-
-# Bind a system message once, then call like a function
-answer = partial(synthesize, system_message="You are an AmEx expert.")
-result = answer(query, hits)
+result = engine.synthesize(query, hits)
 
 # Retrieval only — use with any LLM, any prompt
 hits = store.retrieve(query)
@@ -102,7 +98,7 @@ The decomposer wraps input in `<DATA>` tags and explicitly instructs the LLM to 
 
 ### Why split retrieval from generation?
 
-Every major RAG framework does this — LangChain has `Retriever` + `Chain`, LlamaIndex has `Retriever` + `ResponseSynthesizer` + `QueryEngine`, Haystack has pipeline nodes, and OpenAI exposes `vector_stores.search` separately from `responses.create`. Production teams need to inspect chunks before generation for audit, debugging, compliance, and to reuse chunks across multiple LLM calls. Our surface: `VectorStore.retrieve()` + module-level `synthesize()`. Bind a reusable system message with `functools.partial` — no separate class needed.
+Every major RAG framework does this — LangChain has `Retriever` + `Chain`, LlamaIndex has `Retriever` + `ResponseSynthesizer` + `QueryEngine`, Haystack has pipeline nodes, and OpenAI exposes `vector_stores.search` separately from `responses.create`. Production teams need to inspect chunks before generation for audit, debugging, compliance, and to reuse chunks across multiple LLM calls. The class names follow LlamaIndex: `VectorStore` + `QueryEngine`, with `retrieve()` + `synthesize()`.
 
 ### Why metadata in the chunk text AND in structured storage?
 
@@ -124,12 +120,11 @@ OpenAI's file_search requires the `/files` upload endpoint, which our current pr
 
 ## Configurable Fields
 
-### `synthesize()` — answer-generation config
+### `QueryEngine` — answer-generation config
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `system_message` | Grounded-RAG default | Your team's prompt (override, or bind via `partial`) |
-| `extra_context` | `None` | Extra user message content prepended to the query |
+| `system_message` | Grounded-RAG default | Your team's prompt (override) |
 
 ### Per-call retrieval config
 
@@ -151,8 +146,7 @@ Internal tuning knobs (LLM model name, chunk size/overlap, embedding dims, batch
 Q&A bot over internal policy documents with metadata filtering:
 
 ```python
-from functools import partial
-from file_search import VectorStore, synthesize
+from file_search import VectorStore, QueryEngine
 
 # 1. Index your files with metadata
 store = VectorStore()
@@ -166,10 +160,13 @@ store.save("policy_index.parquet")
 
 # 2. In your service — load once, reuse across queries
 store = VectorStore.load("policy_index.parquet")
-hr_answer = partial(synthesize, system_message=(
-    "You are an HR policy assistant. Answer employee questions using ONLY "
-    "the policy context below. Cite sources inline."
-))
+engine = QueryEngine(
+    store,
+    system_message=(
+        "You are an HR policy assistant. Answer employee questions using ONLY "
+        "the policy context below. Cite sources inline."
+    ),
+)
 
 # 3. Per-query: split retrieval from generation for audit/inspection
 def answer_question(question: str, user_region: str):
@@ -187,7 +184,7 @@ def answer_question(question: str, user_region: str):
     )
 
     # Generate the answer
-    return hr_answer(question, hits)
+    return engine.synthesize(question, hits)
 
 result = answer_question("Can I expense a taxi to a client dinner?", user_region="US")
 print(result["answer"])
