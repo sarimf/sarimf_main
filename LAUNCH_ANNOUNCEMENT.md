@@ -55,7 +55,11 @@ Following the standard pattern from LlamaIndex/LangChain/Haystack, retrieval and
 hits = store.retrieve(query, filters={...})
 audit_log.record(sources=[h["source"] for h in hits])
 hits = [h for h in hits if h["score"] > 0.3]
-result = engine.synthesize(query, hits)
+result = synthesize(query, hits)
+
+# Bind a system message once, then call like a function
+answer = partial(synthesize, system_message="You are an AmEx expert.")
+result = answer(query, hits)
 
 # Retrieval only — use with any LLM, any prompt
 hits = store.retrieve(query)
@@ -67,14 +71,15 @@ For long or multi-topic input (call transcripts, complex queries), break input i
 
 ```python
 # Safe even when input contains adversarial content
-sub_queries = store.decompose_query(
+sub_queries = rewrite_queries(
     data=long_transcript,
     rewrite_instructions="Extract customer concerns about AmEx products",
+    max_queries=20,
 )
 # Returns: ["Platinum annual fee", "Gold groceries rewards", ...]
 
-# Run retrieval across all sub-queries and merge by vote count
-hits = store.retrieve_multi(queries=sub_queries, per_query_k=3, final_k=10)
+# Pass a list to retrieve() — results are ranked by vote count across queries
+hits = store.retrieve(sub_queries, top_k=3, final_k=10)
 ```
 
 The decomposer wraps input in `<DATA>` tags and explicitly instructs the LLM to treat content as inert — safe against prompt injection from user-generated content.
@@ -97,7 +102,7 @@ The decomposer wraps input in `<DATA>` tags and explicitly instructs the LLM to 
 
 ### Why split retrieval from generation?
 
-Every major RAG framework does this — LangChain has `Retriever` + `Chain`, LlamaIndex has `Retriever` + `ResponseSynthesizer` + `QueryEngine`, Haystack has pipeline nodes, and OpenAI exposes `vector_stores.search` separately from `responses.create`. Production teams need to inspect chunks before generation for audit, debugging, compliance, and to reuse chunks across multiple LLM calls. The class names follow LlamaIndex: `VectorStore` + `QueryEngine`, with `retrieve()` + `synthesize()`.
+Every major RAG framework does this — LangChain has `Retriever` + `Chain`, LlamaIndex has `Retriever` + `ResponseSynthesizer` + `QueryEngine`, Haystack has pipeline nodes, and OpenAI exposes `vector_stores.search` separately from `responses.create`. Production teams need to inspect chunks before generation for audit, debugging, compliance, and to reuse chunks across multiple LLM calls. Our surface: `VectorStore.retrieve()` + module-level `synthesize()`. Bind a reusable system message with `functools.partial` — no separate class needed.
 
 ### Why metadata in the chunk text AND in structured storage?
 
@@ -119,24 +124,25 @@ OpenAI's file_search requires the `/files` upload endpoint, which our current pr
 
 ## Configurable Fields
 
-### `QueryEngine` — answer-generation config
+### `synthesize()` — answer-generation config
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `system_message` | Grounded-RAG default | Your team's prompt (override) |
+| `system_message` | Grounded-RAG default | Your team's prompt (override, or bind via `partial`) |
+| `extra_context` | `None` | Extra user message content prepended to the query |
 
 ### Per-call retrieval config
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `top_k` | `10` | Candidates pulled from hybrid search |
-| `final_k` | `5` | Returned after optional rerank |
-| `rerank` | `False` | Enable LLM reranking (+1 call, better quality) |
-| `rewrite_instructions` | `None` | If truthy, rewrite the query via LLM before searching |
+| `query` | — | A single string, or a list of queries (list ⇒ vote-count ranking) |
+| `top_k` | `10` | Candidates pulled from hybrid search (per query when list) |
+| `final_k` | `5` | Returned after optional rerank / vote merge |
+| `rerank` | `False` | Enable LLM reranking (+1 call, better quality; single-query only) |
+| `rewrite_instructions` | `None` | If truthy, rewrite the query via LLM before searching (single-query only) |
 | `filters` | `None` | Restrict to chunks whose metadata matches |
-| `extra_context` | `None` | (synthesize only) Extra user message content |
 
-Internal tuning knobs (LLM model name, chunk size/overlap, embedding dims, batch size, generation temperature and max tokens, context template) are module-level constants in `file_search.py`. Edit them there if needed — no real caller has wanted to change them per-instance.
+Internal tuning knobs (LLM model name, chunk size/overlap, embedding dims, batch size, generation temperature and max tokens) are module-level constants in `file_search.py`. Edit them there if needed — no real caller has wanted to change them per-instance.
 
 ---
 
@@ -145,7 +151,8 @@ Internal tuning knobs (LLM model name, chunk size/overlap, embedding dims, batch
 Q&A bot over internal policy documents with metadata filtering:
 
 ```python
-from file_search import VectorStore, QueryEngine
+from functools import partial
+from file_search import VectorStore, synthesize
 
 # 1. Index your files with metadata
 store = VectorStore()
@@ -159,13 +166,10 @@ store.save("policy_index.parquet")
 
 # 2. In your service — load once, reuse across queries
 store = VectorStore.load("policy_index.parquet")
-engine = QueryEngine(
-    store,
-    system_message=(
-        "You are an HR policy assistant. Answer employee questions using ONLY "
-        "the policy context below. Cite sources inline."
-    ),
-)
+hr_answer = partial(synthesize, system_message=(
+    "You are an HR policy assistant. Answer employee questions using ONLY "
+    "the policy context below. Cite sources inline."
+))
 
 # 3. Per-query: split retrieval from generation for audit/inspection
 def answer_question(question: str, user_region: str):
@@ -183,7 +187,7 @@ def answer_question(question: str, user_region: str):
     )
 
     # Generate the answer
-    return engine.synthesize(question, hits)
+    return hr_answer(question, hits)
 
 result = answer_question("Can I expense a taxi to a client dinner?", user_region="US")
 print(result["answer"])
