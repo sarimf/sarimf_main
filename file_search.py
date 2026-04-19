@@ -31,7 +31,6 @@ import pandas as pd
 from rank_bm25 import BM25Okapi
 from openai import AzureOpenAI
 from tenacity import retry, stop_after_attempt
-from safechain.utils import get_token_from_env
 
 
 __all__ = ["VectorStore", "QueryEngine"]
@@ -109,7 +108,7 @@ def _split_text(text: str) -> list[str]:
 def _call_embedding_api(batch_texts: list[str]):
     client = AzureOpenAI(
         azure_endpoint="https://eag-qa.aexp.com/genai/microsoft/v1/gcs_distribution_efficiency",
-        api_key=get_token_from_env('ada-3-large'),
+        api_key=get_token_from_env('ada-3-large'),  # noqa: F821
         api_version="2024-06-01",
     )
     return client.embeddings.create(
@@ -144,7 +143,7 @@ def _build_chat_client() -> AzureOpenAI:
     """Build a fresh chat client per call (avoids stale-connection timeouts)."""
     return AzureOpenAI(
         azure_endpoint=f"https://eag-qa.aexp.com/genai/microsoft/v1/models/{LLM_ENDPOINT_NAME}/",
-        api_key=get_token_from_env(LLM_TOKEN_KEY),
+        api_key=get_token_from_env(LLM_TOKEN_KEY),  # noqa: F821
         api_version="2024-10-21",
     )
 
