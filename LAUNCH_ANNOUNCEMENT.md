@@ -119,18 +119,11 @@ OpenAI's file_search requires the `/files` upload endpoint, which our current pr
 
 ## Configurable Fields
 
-### `FileSearch` — indexing-time config
-
-| Parameter | Default | Purpose |
-|---|---|---|
-| `llm_model` | `"gpt-41"` | Model for rewrite/decompose/rerank calls |
-
 ### `Assistant` — answer-generation config
 
 | Parameter | Default | Purpose |
 |---|---|---|
 | `system_message` | Grounded-RAG default | Your team's prompt (override) |
-| `model` | `"gpt-41"` | Generation model |
 
 ### Per-call retrieval config
 
@@ -143,7 +136,7 @@ OpenAI's file_search requires the `/files` upload endpoint, which our current pr
 | `metadata_filter` | `None` | Restrict to chunks whose metadata matches |
 | `extra_user_context` | `None` | (synthesize only) Extra user message content |
 
-Internal tuning knobs (chunk size/overlap, embedding dims, batch size, generation temperature and max tokens, context template) are module-level constants in `file_search.py`. Edit them there if needed — no real caller has wanted to change them per-instance.
+Internal tuning knobs (LLM model name, chunk size/overlap, embedding dims, batch size, generation temperature and max tokens, context template) are module-level constants in `file_search.py`. Edit them there if needed — no real caller has wanted to change them per-instance.
 
 ---
 
