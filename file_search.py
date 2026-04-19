@@ -116,6 +116,15 @@ def _call_embedding_api(batch_texts: list[str]):
     )
 
 
+def _format_metadata_prefix(metadata: dict) -> str:
+    if not metadata:
+        return ""
+    def clean(v):
+        return str(v).replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
+    parts = [f"{k}: {clean(v)}" for k, v in metadata.items()]
+    return "[" + " | ".join(parts) + "]"
+
+
 def _embed_texts(texts: list[str]) -> np.ndarray:
     all_embs = []
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
@@ -190,17 +199,22 @@ class VectorStore:
         self.bm25: Optional[BM25Okapi] = None
 
     # -------------------- Indexing --------------------
-    def add_file(self, path: str) -> int:
+    def add_file(self, path: str, metadata: Optional[dict] = None) -> int:
         """Parse, chunk, embed, and index a single file. Returns chunk count added.
 
-        The chunk's source is derived automatically from the file stem.
+        `metadata` (if provided) is prefixed into every chunk's text — the LLM sees
+        `[product: ... | source: <stem>]` before each fact. No structural storage,
+        no filtering. `source` is added automatically from the file stem.
         """
         new_chunks = _split_text(_parse_file(path))
         if not new_chunks:
             return 0
         source = Path(path).stem
-        embs = _embed_texts(new_chunks)
-        self.chunks.extend(new_chunks)
+        meta_for_prefix = {**(metadata or {}), "source": source}
+        prefix = _format_metadata_prefix(meta_for_prefix)
+        prefixed = [f"{prefix}\n{c}" for c in new_chunks] if prefix else new_chunks
+        embs = _embed_texts(prefixed)
+        self.chunks.extend(prefixed)
         self.sources.extend([source] * len(new_chunks))
         self.embeddings = embs if self.embeddings is None else np.vstack([self.embeddings, embs])
         self.bm25 = BM25Okapi([c.lower().split() for c in self.chunks])
