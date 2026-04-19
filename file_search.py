@@ -16,7 +16,7 @@ QUICKSTART
     store = VectorStore.load("my_index.parquet")
     engine = QueryEngine(store, system_message="You are an AmEx expert.")
     hits = store.retrieve("annual fee")
-    print(engine.synthesize("annual fee", hits)["answer"])
+    print(engine.synthesize("annual fee", hits)["response"])
 
 DEPENDENCIES
 ------------
@@ -31,6 +31,7 @@ import pandas as pd
 from rank_bm25 import BM25Okapi
 from openai import AzureOpenAI
 from tenacity import retry, stop_after_attempt
+from safechain.utils import get_token_from_env
 
 
 __all__ = ["VectorStore", "QueryEngine"]
@@ -38,6 +39,8 @@ __all__ = ["VectorStore", "QueryEngine"]
 
 # ---- Tuning constants ------------------------------------------------------
 LLM_MODEL = "gpt-4.1"
+LLM_ENDPOINT_NAME = "gpt-41"
+LLM_TOKEN_KEY = "gpt41"
 EMBED_DIMS = 256
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 300
@@ -106,7 +109,7 @@ def _split_text(text: str) -> list[str]:
 def _call_embedding_api(batch_texts: list[str]):
     client = AzureOpenAI(
         azure_endpoint="https://eag-qa.aexp.com/genai/microsoft/v1/gcs_distribution_efficiency",
-        api_key=get_token_from_env('ada-3-large'),  # noqa: F821
+        api_key=get_token_from_env('ada-3-large'),
         api_version="2024-06-01",
     )
     return client.embeddings.create(
@@ -140,8 +143,8 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
 def _build_chat_client() -> AzureOpenAI:
     """Build a fresh chat client per call (avoids stale-connection timeouts)."""
     return AzureOpenAI(
-        azure_endpoint=f"https://eag-qa.aexp.com/genai/microsoft/v1/models/{LLM_MODEL}/",
-        api_key=get_token_from_env(LLM_MODEL),  # noqa: F821
+        azure_endpoint=f"https://eag-qa.aexp.com/genai/microsoft/v1/models/{LLM_ENDPOINT_NAME}/",
+        api_key=get_token_from_env(LLM_TOKEN_KEY),
         api_version="2024-10-21",
     )
 
@@ -175,12 +178,12 @@ class QueryEngine:
             f"[Source: {h['source']}]\n{h['text']}" for h in hits
         )
         full_system = self.system_message + f"\n\nCONTEXT:\n{context}"
-        answer = _chat_complete([
+        response = _chat_complete([
             {"role": "system", "content": full_system},
             {"role": "user", "content": query},
         ])
         return {
-            "answer": answer,
+            "response": response,
             "sources": [h["source"] for h in hits],
             "chunks": hits,
         }
@@ -202,23 +205,46 @@ class VectorStore:
     def add_file(self, path: str, metadata: Optional[dict] = None) -> int:
         """Parse, chunk, embed, and index a single file. Returns chunk count added.
 
-        `metadata` (if provided) is prefixed into every chunk's text — the LLM sees
-        `[product: ... | source: <stem>]` before each fact. No structural storage,
-        no filtering. `source` is added automatically from the file stem.
+        `metadata` (if provided) is prefixed into every chunk's text — the LLM
+        sees `[k: v | ...]` before each fact. No structural storage, no
+        filtering. The file stem is stored separately on `self.sources` for
+        citation; it is NOT auto-added to the in-text prefix.
         """
-        new_chunks = _split_text(_parse_file(path))
-        if not new_chunks:
-            return 0
-        source = Path(path).stem
-        meta_for_prefix = {**(metadata or {}), "source": source}
-        prefix = _format_metadata_prefix(meta_for_prefix)
-        prefixed = [f"{prefix}\n{c}" for c in new_chunks] if prefix else new_chunks
-        embs = _embed_texts(prefixed)
-        self.chunks.extend(prefixed)
-        self.sources.extend([source] * len(new_chunks))
-        self.embeddings = embs if self.embeddings is None else np.vstack([self.embeddings, embs])
-        self.bm25 = BM25Okapi([c.lower().split() for c in self.chunks])
-        return len(new_chunks)
+        return self.add_files([path], [metadata])
+
+    def add_files(
+        self,
+        paths: list[str],
+        metadatas: Optional[list[Optional[dict]]] = None,
+    ) -> int:
+        """Bulk-index N files with one BM25 rebuild at the end.
+
+        `metadatas`, if provided, must align 1:1 with `paths`; pass `None` to
+        index all files without a metadata prefix. Returns total chunk count
+        added.
+        """
+        if metadatas is None:
+            metadatas = [None] * len(paths)
+        if len(metadatas) != len(paths):
+            raise ValueError(
+                f"len(metadatas)={len(metadatas)} must match len(paths)={len(paths)}"
+            )
+        total = 0
+        for path, meta in zip(paths, metadatas):
+            new_chunks = _split_text(_parse_file(path))
+            if not new_chunks:
+                continue
+            source = Path(path).stem
+            prefix = _format_metadata_prefix(meta or {})
+            prefixed = [f"{prefix}\n{c}" for c in new_chunks] if prefix else new_chunks
+            embs = _embed_texts(prefixed)
+            self.chunks.extend(prefixed)
+            self.sources.extend([source] * len(new_chunks))
+            self.embeddings = embs if self.embeddings is None else np.vstack([self.embeddings, embs])
+            total += len(new_chunks)
+        if total:
+            self.bm25 = BM25Okapi([c.lower().split() for c in self.chunks])
+        return total
 
     # -------------------- Persistence --------------------
     def save(self, path: str) -> None:
@@ -244,9 +270,8 @@ class VectorStore:
         return store
 
     # -------------------- Retrieval primitives --------------------
-    def _dense_retrieve(self, query: str, k: int) -> list[int]:
-        q = _embed_texts([query])[0]
-        sims = self.embeddings @ q
+    def _dense_retrieve(self, q_vec: np.ndarray, k: int) -> list[int]:
+        sims = self.embeddings @ q_vec
         k = min(k, len(sims))
         top = np.argpartition(-sims, k - 1)[:k]
         return top[np.argsort(-sims[top])].tolist()
@@ -263,8 +288,8 @@ class VectorStore:
                 scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
         return sorted(scores.items(), key=lambda x: -x[1])
 
-    def _hybrid_search(self, query: str, k: int) -> list[tuple[int, float]]:
-        dense = self._dense_retrieve(query, k)
+    def _hybrid_search(self, query: str, q_vec: np.ndarray, k: int) -> list[tuple[int, float]]:
+        dense = self._dense_retrieve(q_vec, k)
         sparse = self._sparse_retrieve(query, k)
         return self._rrf([dense, sparse])[:k]
 
@@ -273,30 +298,35 @@ class VectorStore:
         self,
         query: str,
         top_k: int = 10,
-        final_k: int = 5,
+        top_n: int = 5,
     ) -> list[dict]:
         """Retrieve relevant chunks for a query.
 
         Long queries (more than CHUNK_SIZE words) are split internally into
         overlapping word-window sub-queries. Hybrid search runs per sub-query
         pulling top_k each; rankings are merged with Reciprocal Rank Fusion and
-        the top final_k are returned. Short queries take the same path with one
+        the top top_n are returned. Short queries take the same path with one
         sub-query (degenerate RRF).
 
-        final_k MAY exceed top_k: with N sub-queries, the RRF pool can hold up
-        to N*top_k unique chunks. final_k is an upper bound on the returned
+        All sub-query embeddings are computed in a single batched API call —
+        one network round-trip regardless of N.
+
+        top_n MAY exceed top_k: with N sub-queries, the RRF pool can hold up
+        to N*top_k unique chunks. top_n is an upper bound on the returned
         list — when sub-queries overlap heavily, the unique pool may be smaller
-        than final_k, in which case fewer hits are returned.
+        than top_n, in which case fewer hits are returned.
         """
         if not self.chunks:
             return []
 
         sub_queries = _split_text(query) or [query]
+        q_vecs = _embed_texts(sub_queries)
+
         rankings = [
-            [i for i, _ in self._hybrid_search(q, top_k)]
-            for q in sub_queries
+            [i for i, _ in self._hybrid_search(sub_q, q_vecs[i], top_k)]
+            for i, sub_q in enumerate(sub_queries)
         ]
-        fused = self._rrf(rankings)[:final_k]
+        fused = self._rrf(rankings)[:top_n]
 
         return [
             {

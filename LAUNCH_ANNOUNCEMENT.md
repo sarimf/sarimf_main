@@ -22,7 +22,7 @@ from file_search import VectorStore, QueryEngine
 
 Two classes. That's it.
 
-- `VectorStore` — `add_file`, `save`, `load`, `retrieve`.
+- `VectorStore` — `add_file`, `add_files` (bulk), `save`, `load`, `retrieve`.
 - `QueryEngine` — `__init__(store, system_message=...)`, `synthesize(query, hits)`.
 
 ---
@@ -32,9 +32,14 @@ Two classes. That's it.
 - Parses `.txt`, `.md`, `.pdf`, `.docx`.
 - 600-word chunks with 300-word overlap (~800/400 tokens).
 - **Metadata prefix at indexing time** — pass `metadata={...}` to `add_file`;
-  the keys are rendered as `[k: v | ... | source: <stem>]` at the top of every
-  chunk, so the LLM sees attribution inline in CONTEXT. No structural storage,
-  no retrieval-time filtering.
+  the keys are rendered as `[k: v | ...]` at the top of every chunk, so the
+  LLM sees attribution inline in CONTEXT. The file stem is kept on
+  `VectorStore.sources` for citation (surfaced as a separate `[Source: ...]`
+  line by `synthesize`) and is NOT auto-injected into the in-text prefix. No
+  structural storage, no retrieval-time filtering.
+- **Bulk indexing** — `add_files(paths, metadatas=None)` ingests N files and
+  rebuilds BM25 once at the end, avoiding the O(N²) rescan of per-file
+  `add_file` calls.
 - API embeddings via `text-embedding-3-large`.
 - Hybrid search: semantic (NumPy cosine) + keyword (BM25) via Reciprocal Rank
   Fusion.
@@ -75,15 +80,16 @@ search expects.
 ### Why metadata as text prefix only?
 
 Callers that want product attribution at generation time get it for free via
-the prefix — every chunk carries its own `[product: ... | source: ...]` tag
-that flows unchanged into CONTEXT. We don't pay the complexity cost of a
-filtering code path when retrieval-time filtering isn't a BU requirement.
+the prefix — every chunk carries its own `[product: ...]` tag (or whatever
+keys the caller passed) that flows unchanged into CONTEXT. We don't pay the
+complexity cost of a filtering code path when retrieval-time filtering isn't
+a BU requirement.
 
-### Why `final_k` can exceed `top_k`
+### Why `top_n` can exceed `top_k`
 
 With N sub-queries, the merged RRF pool can hold up to N × `top_k` unique
-chunks. `final_k` is an upper bound on the returned list — when sub-queries
-overlap heavily, the unique pool may be smaller than `final_k`, so fewer
+chunks. `top_n` is an upper bound on the returned list — when sub-queries
+overlap heavily, the unique pool may be smaller than `top_n`, so fewer
 hits are returned.
 
 ---
@@ -102,11 +108,11 @@ hits are returned.
 |---|---|---|
 | `query` | — | A search string (long queries are split internally) |
 | `top_k` | `10` | Candidates pulled from hybrid search per sub-query |
-| `final_k` | `5` | Upper bound on the returned list (after RRF merge) |
+| `top_n` | `5` | Upper bound on the returned list (after RRF merge) |
 
-Internal tuning knobs — `LLM_MODEL`, `CHUNK_SIZE`, `CHUNK_OVERLAP`,
-`EMBED_DIMS`, `EMBED_BATCH_SIZE` — are module-level constants in
-`file_search.py`. Edit them there if needed.
+Internal tuning knobs — `LLM_MODEL`, `LLM_ENDPOINT_NAME`, `LLM_TOKEN_KEY`,
+`CHUNK_SIZE`, `CHUNK_OVERLAP`, `EMBED_DIMS`, `EMBED_BATCH_SIZE` — are
+module-level constants in `file_search.py`. Edit them there if needed.
 
 ---
 
@@ -142,7 +148,7 @@ def answer_question(question: str):
     return engine.synthesize(question, hits)
 
 result = answer_question("Can I expense a taxi to a client dinner?")
-print(result["answer"])
+print(result["response"])
 ```
 
 ---
