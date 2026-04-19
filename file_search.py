@@ -7,20 +7,16 @@ Parquet persistence.
 
 QUICKSTART
 ----------
-    from functools import partial
-    from file_search import VectorStore, synthesize, rewrite_queries
+    from file_search import VectorStore, QueryEngine, rewrite_queries
 
     store = VectorStore()
     store.add_file("docs/product.pdf", metadata={"product": "Platinum"})
     store.save("my_index.parquet")
 
     store = VectorStore.load("my_index.parquet")
+    engine = QueryEngine(store, system_message="You are an AmEx expert.")
     hits = store.retrieve("annual fee", filters={"product": "Platinum"})
-    print(synthesize("annual fee", hits)["answer"])
-
-    # Bind a system message once:
-    answer = partial(synthesize, system_message="You are an AmEx expert.")
-    print(answer("annual fee", hits)["answer"])
+    print(engine.synthesize("annual fee", hits)["answer"])
 
 DEPENDENCIES
 ------------
@@ -39,7 +35,7 @@ from openai import AzureOpenAI, RateLimitError, APITimeoutError, APIConnectionEr
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 
-__all__ = ["VectorStore", "synthesize", "rewrite_queries"]
+__all__ = ["VectorStore", "QueryEngine", "rewrite_queries"]
 
 
 # ---- Tuning constants ------------------------------------------------------
@@ -210,39 +206,44 @@ def rewrite_queries(
         return []
 
 
-def synthesize(
-    query: str,
-    hits: list[dict],
-    system_message: Optional[str] = None,
-    extra_context: Optional[str] = None,
-) -> dict:
-    """Generate an answer from pre-fetched chunks.
+class QueryEngine:
+    """Wraps a VectorStore with a bound system_message to generate grounded answers.
 
-    Inspect/filter hits between retrieve() and synthesize() when you need audit
-    logging, quality checks, or multi-step flows. Bind a reusable system
-    message with functools.partial.
+    Inspect/filter hits between store.retrieve() and engine.synthesize() when you
+    need audit logging, quality checks, or multi-step flows.
     """
-    context = "\n\n---\n\n".join(
-        f"[Source: {h['source']}]\n{h['text']}" for h in hits
-    )
-    full_system = (system_message or DEFAULT_SYSTEM) + f"\n\nCONTEXT:\n{context}"
-    user = f"{extra_context}\n\n{query}" if extra_context else query
 
-    resp = _build_chat_client().chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": full_system},
-            {"role": "user", "content": user},
-        ],
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS,
-    )
-    return {
-        "answer": resp.choices[0].message.content.strip(),
-        "sources": [h["source"] for h in hits],
-        "chunks": hits,
-        "search_query_used": hits[0].get("search_query") if hits else None,
-    }
+    def __init__(self, store: "VectorStore", system_message: Optional[str] = None):
+        self.store = store
+        self.system_message = system_message or DEFAULT_SYSTEM
+
+    def synthesize(
+        self,
+        query: str,
+        hits: list[dict],
+        extra_context: Optional[str] = None,
+    ) -> dict:
+        context = "\n\n---\n\n".join(
+            f"[Source: {h['source']}]\n{h['text']}" for h in hits
+        )
+        full_system = self.system_message + f"\n\nCONTEXT:\n{context}"
+        user = f"{extra_context}\n\n{query}" if extra_context else query
+
+        resp = _build_chat_client().chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": full_system},
+                {"role": "user", "content": user},
+            ],
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+        )
+        return {
+            "answer": resp.choices[0].message.content.strip(),
+            "sources": [h["source"] for h in hits],
+            "chunks": hits,
+            "search_query_used": hits[0].get("search_query") if hits else None,
+        }
 
 
 # ============================================================================
