@@ -41,16 +41,20 @@ Two classes. That's it.
   rebuilds BM25 once at the end, avoiding the O(N²) rescan of per-file
   `add_file` calls.
 - API embeddings via `text-embedding-3-large`.
-- Hybrid search: semantic (NumPy cosine) + keyword (BM25) via Reciprocal Rank
-  Fusion.
+- Hybrid search: semantic (NumPy cosine) + keyword (BM25). Per-sub-query
+  (dense, sparse) are fused with Reciprocal Rank Fusion; across sub-queries
+  the fuse is CombSUM over dense cosines — weighting by retrieval quality,
+  not just rank. Contributions below `OUTER_COSINE_THRESHOLD` are dropped
+  so junk sub-queries can't accumulate nonzero votes.
 - **Automatic query decomposition, cost-bounded.** Long queries are split
-  internally into overlapping word-window sub-queries; per-sub-query hybrid
-  rankings are RRF-merged. The sub-query count is capped at
-  `MAX_SUB_QUERIES` (evenly-spaced), so embedding / BM25 / matmul cost stays
-  bounded regardless of query length. Sub-query window size and overlap
+  internally into overlapping word-window sub-queries; inner (dense, sparse)
+  are RRF-merged per sub-query, then outer CombSUM-merged across sub-queries
+  on dense cosines. The sub-query count is capped at `MAX_SUB_QUERIES`
+  (evenly-spaced), so embedding / BM25 / matmul cost stays bounded
+  regardless of query length. Sub-query window size and overlap
   (`SUB_QUERY_CHUNK_SIZE` / `SUB_QUERY_OVERLAP`) are tunable independently
   of the indexing window, with per-call overrides on `retrieve()`. Short
-  queries take the same path with one sub-query (degenerate RRF).
+  queries take the same path with one sub-query.
 - Separate `retrieve()` and `synthesize()` so production code can inspect,
   audit, or filter hits before generation.
 - Uniform burst retry on every network call: 5 rapid attempts (~0.2 s apart)
@@ -90,10 +94,12 @@ a BU requirement.
 
 ### Why `top_n` can exceed `top_k`
 
-With N sub-queries, the merged RRF pool can hold up to N × `top_k` unique
+With N sub-queries, the outer pool can hold up to N × `top_k` unique
 chunks. `top_n` is an upper bound on the returned list — when sub-queries
 overlap heavily, the unique pool may be smaller than `top_n`, so fewer
-hits are returned.
+hits are returned. The returned `score` is the outer CombSUM (sum of
+above-threshold dense cosines across matching sub-queries), not a
+rank-fusion score.
 
 ---
 
@@ -117,13 +123,16 @@ hits are returned.
 
 Internal tuning knobs — `LLM_MODEL`, `LLM_ENDPOINT_NAME`, `LLM_TOKEN_KEY`,
 `CHUNK_SIZE`, `CHUNK_OVERLAP`, `EMBED_DIMS`, `EMBED_BATCH_SIZE`,
-`MAX_SUB_QUERIES`, `SUB_QUERY_CHUNK_SIZE`, `SUB_QUERY_OVERLAP` — are
-module-level constants in `file_search.py`. Edit them there if needed.
-`MAX_SUB_QUERIES` (`16`) caps retrieval-side sub-query decomposition to
-keep embedding / BM25 / matmul cost bounded for long prompts.
-`SUB_QUERY_CHUNK_SIZE` / `SUB_QUERY_OVERLAP` (default to `CHUNK_SIZE` /
-`CHUNK_OVERLAP`) let you use coarser windows at retrieval time than at
-indexing time — larger windows = fewer, coarser probes, lower cost.
+`MAX_SUB_QUERIES`, `SUB_QUERY_CHUNK_SIZE`, `SUB_QUERY_OVERLAP`,
+`OUTER_COSINE_THRESHOLD` — are module-level constants in `file_search.py`.
+Edit them there if needed. `MAX_SUB_QUERIES` (`16`) caps retrieval-side
+sub-query decomposition to keep embedding / BM25 / matmul cost bounded for
+long prompts. `SUB_QUERY_CHUNK_SIZE` / `SUB_QUERY_OVERLAP` (default to
+`CHUNK_SIZE` / `CHUNK_OVERLAP`) let you use coarser windows at retrieval
+time than at indexing time — larger windows = fewer, coarser probes, lower
+cost. `OUTER_COSINE_THRESHOLD` (`0.3`) is the per-contribution cosine floor
+for the outer CombSUM — chunks retrieved by a sub-query whose cosine falls
+below this earn no outer vote, suppressing junk-sub-query accumulation.
 
 ---
 
@@ -171,7 +180,7 @@ print(result["response"])
 | File upload & indexing | ✅ | ✅ |
 | Chunking (800/400 tokens equiv) | ✅ | ✅ |
 | Hybrid search (semantic + BM25) | ✅ | ✅ |
-| Rank fusion (RRF) | ✅ | ✅ |
+| Rank fusion | ✅ (RRF) | ✅ (RRF inner, CombSUM outer) |
 | Reranking | ✅ (built-in) | ❌ (removed) |
 | Query rewriting | ✅ | ❌ (removed) |
 | Query decomposition | ✅ (built-in) | ✅ (automatic, deterministic) |
