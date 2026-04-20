@@ -47,6 +47,7 @@ EMBED_BATCH_SIZE = 64
 MAX_SUB_QUERIES = 16
 SUB_QUERY_CHUNK_SIZE = CHUNK_SIZE
 SUB_QUERY_OVERLAP = CHUNK_OVERLAP
+OUTER_COSINE_THRESHOLD = 0.3
 DEFAULT_SYSTEM = (
     "Answer using ONLY the context below. If the answer isn't in the context, "
     "say you don't know. Cite sources inline as [Source: <filename>]."
@@ -276,20 +277,6 @@ class VectorStore:
         return store
 
     # -------------------- Retrieval primitives --------------------
-    def _dense_retrieve_batch(self, q_vecs: np.ndarray, k: int) -> list[list[int]]:
-        """Top-k dense indices per sub-query, via one batched matmul.
-
-        `q_vecs` is (N_sub, dim). Returns a list of N_sub top-k index lists.
-        """
-        sims_all = self.embeddings @ q_vecs.T
-        k = min(k, sims_all.shape[0])
-        out = []
-        for j in range(sims_all.shape[1]):
-            sims = sims_all[:, j]
-            top = np.argpartition(-sims, k - 1)[:k]
-            out.append(top[np.argsort(-sims[top])].tolist())
-        return out
-
     def _sparse_retrieve(self, query: str, k: int) -> list[int]:
         scores = self.bm25.get_scores(query.lower().split())
         return sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
@@ -313,24 +300,33 @@ class VectorStore:
     ) -> list[dict]:
         """Retrieve relevant chunks for a query.
 
+        Two-level fusion:
+          - Inner (per sub-query): RRF over (dense top_k, BM25 top_k).
+            Rank-based; cosine and BM25 scores aren't directly comparable.
+          - Outer (across sub-queries): CombSUM over dense cosines.
+            L2-normalized embeddings make cosines absolute-comparable across
+            sub-queries, so a chunk's final score is the sum of its cosines
+            to each sub-query that matched it in the inner top_k.
+            Contributions below OUTER_COSINE_THRESHOLD are dropped so junk
+            sub-queries (those whose inner top_k is populated by weak
+            matches) can't accumulate nonzero votes.
+
         Long queries are split internally into overlapping word-window
         sub-queries via `_split_text`. Window size and overlap default to
         SUB_QUERY_CHUNK_SIZE / SUB_QUERY_OVERLAP; override per call via
         `sub_chunk_size` / `sub_overlap` — larger windows yield coarser
-        probes and lower cost.
-
-        The sub-query list is capped at MAX_SUB_QUERIES via evenly-spaced
-        indices (preserving coverage across the prompt), so cost stays
-        bounded regardless of query length. Hybrid search runs per sub-query
-        pulling top_k each; rankings are merged with Reciprocal Rank Fusion
-        and the top top_n are returned.
+        probes and lower cost. The sub-query list is capped at
+        MAX_SUB_QUERIES via evenly-spaced indices (preserving coverage
+        across the prompt), so cost stays bounded regardless of query
+        length.
 
         All sub-query embeddings are computed in a single batched API call,
         and dense similarities are computed in a single matmul.
 
-        top_n MAY exceed top_k: with N sub-queries, the RRF pool can hold up
-        to N*top_k unique chunks. top_n is an upper bound — heavy sub-query
-        overlap may shrink the unique pool below top_n.
+        top_n MAY exceed top_k: the outer pool can hold up to N*top_k
+        unique chunks. Heavy sub-query overlap may shrink the pool below
+        top_n. The returned `score` is the outer CombSUM — sum of
+        above-threshold dense cosines — not a rank-fusion score.
         """
         if not self.chunks:
             return []
@@ -344,14 +340,22 @@ class VectorStore:
             sub_queries = [sub_queries[i] for i in idxs]
 
         q_vecs = _embed_texts(sub_queries)
-        dense_rankings = self._dense_retrieve_batch(q_vecs, top_k)
+        sims_all = self.embeddings @ q_vecs.T
+        k_dense = min(top_k, sims_all.shape[0])
 
-        rankings = []
+        outer_scores: dict[int, float] = {}
         for j, sub_q in enumerate(sub_queries):
+            sims = sims_all[:, j]
+            top = np.argpartition(-sims, k_dense - 1)[:k_dense]
+            dense = top[np.argsort(-sims[top])].tolist()
             sparse = self._sparse_retrieve(sub_q, top_k)
-            merged = self._rrf([dense_rankings[j], sparse])[:top_k]
-            rankings.append([i for i, _ in merged])
-        fused = self._rrf(rankings)[:top_n]
+            merged = self._rrf([dense, sparse])[:top_k]
+            for chunk_id, _ in merged:
+                cos_ij = float(sims[chunk_id])
+                if cos_ij >= OUTER_COSINE_THRESHOLD:
+                    outer_scores[chunk_id] = outer_scores.get(chunk_id, 0.0) + cos_ij
+
+        fused = sorted(outer_scores.items(), key=lambda x: -x[1])[:top_n]
 
         return [
             {
